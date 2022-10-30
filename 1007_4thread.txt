@@ -1,0 +1,8 @@
+triggers len: 2 n_workers: 64 n_iter_group: 0 
+trigger_groups len: 0
+init time: 1 ms
+wait join time: 0 ms
+collect  time: 0 ms
+send  time: 0 ms
+------------block_state results size:0-------------------
+------------END block_state results-------------------
