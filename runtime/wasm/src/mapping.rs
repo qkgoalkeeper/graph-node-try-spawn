@@ -56,44 +56,65 @@ pub fn spawn_module<C: Blockchain>(
                 } = request;
 
                 let init_time = Instant::now();
-                let n_workers = 2;
-                let n_iter_group = triggers.len() / n_workers;
+                let n_workers = triggers.len();
+                // let n_iter_group = triggers.len() / n_workers;
                 let pool = ThreadPool::with_name("mapping_worker".into(), n_workers);
 
                 let (sender, receiver) = std::sync::mpsc::channel();
 
-                let mut trigger_groups = Vec::new();
-                let mut trigger_group = Vec::new();
+                // let mut trigger_groups = Vec::new();
+                // let mut trigger_group = Vec::new();
                 // println!(
                 //     "triggers len: {} n_workers: {} n_iter_group: {} ",
                 //     triggers.len(),
                 //     n_workers,
                 //     n_iter_group
                 // );
-                for trigger in triggers {
-                    trigger_group.push(trigger);
-                    if trigger_group.len() == n_iter_group {
-                        trigger_groups.push(trigger_group);
-                        trigger_group = Vec::new();
-                    }
-                }
+                // for i in 0..triggers.len(){
+                //     for trigger in triggers[i] {
+                //         trigger_group.push(trigger);
+                //         if trigger_group.len() == n_iter_group {
+                //             trigger_groups.push(trigger_group);
+                //             trigger_group = Vec::new();
+                //         }
+                //     }
 
-                // 剩余的trigger继续添加到最后一个group
-                let tmp = if let Some(mut tmp) = trigger_groups.pop() {
-                    tmp.append(&mut trigger_group);
-                    trigger_groups.push(tmp);
-                };
+                // }
+
+
+                // // 剩余的trigger继续添加到最后一个group
+                // let tmp = if let Some(mut tmp) = trigger_groups.pop() {
+                //     tmp.append(&mut trigger_group);
+                //     trigger_groups.push(tmp);
+                // };
 
                 // println!("trigger_groups len: {}", trigger_groups.len());
                 // println!("init time: {} ms", init_time.elapsed().as_millis());
 
-                for trigger_group in trigger_groups {
+                // for trigger_group in trigger_groups {
+
+                let mut last_block_number = ctx.block_ptr.clone();
+                let mut block_numbers = ctx.other_block_ptrs.clone();
+
+                //让并发时记住每个并发代表的块号不然会乱
+                let mut block_number_order = Vec::new();
+                for i in 0..block_numbers.len(){
+                    let temp_block_number = block_numbers.pop().unwrap();
+                    block_number_order.push(temp_block_number);
+                }
+                block_number_order.push(last_block_number);
+
+
+                let mut number = 0;
+                for trigger_group in triggers {
                     let t2 = host_metrics.cheap_clone();
                     let t1 = valid_module.cheap_clone();
                     let t3 = timeout.clone();
                     let t4 = experimental_features.clone();
                     let ctx_arc = ctx.derive_with_empty_block_state();
                     let s = sender.clone();
+
+                    let block_number_for_now_triggers = block_number_order[number].clone();
                     pool.execute(move || {
                         let id = thread::current().id();
                         let start_dt = Local::now();
@@ -112,7 +133,7 @@ pub fn spawn_module<C: Blockchain>(
                             t3,
                             t4,
                         );
-                        s.send(result).unwrap();
+                        s.send((result,block_number_for_now_triggers)).unwrap();
                         // thread::sleep(Duration::from_millis(100));
                         // println!(
                         //     "thread {:?}  used time: {} ms",
@@ -120,6 +141,8 @@ pub fn spawn_module<C: Blockchain>(
                         //     start_time.elapsed().as_millis()
                         // );
                     });
+
+                    number+=1;
                 }
 
                 let wait_time = Instant::now();
@@ -129,11 +152,16 @@ pub fn spawn_module<C: Blockchain>(
                 let collect_time = Instant::now();
                 let res_groups: Vec<_> = receiver.try_iter().collect();
                 let mut res = Vec::new();
-                for res_group in res_groups {
+                
+                for res_group_struct in res_groups {
+                    let res_group = res_group_struct.0;
+                    let mut temp_res = Vec::new();
                     for res_temp in res_group {
-                        res.push(res_temp);
+                        temp_res.push(res_temp);
                     }
+                    res.push((temp_res,res_group_struct.1));
                 }
+
                 // println!("collect  time: {} ms", collect_time.elapsed().as_millis());
 
                 let send_time = Instant::now();
@@ -193,8 +221,8 @@ fn instantiate_module_and_handle_trigger_group<C: Blockchain>(
 
 pub struct MappingRequest<C: Blockchain> {
     pub(crate) ctx: MappingContext<C>,
-    pub(crate) triggers: Vec<TriggerWithHandler<C>>,
-    pub(crate) result_sender: Sender<Vec<Result<(BlockState<C>, Gas), MappingError>>>,
+    pub(crate) triggers: Vec<Vec<TriggerWithHandler<C>>>,
+    pub(crate) result_sender: Sender<Vec<(Vec<Result<(BlockState<C>, Gas), MappingError>>,BlockPtr)>>,
 }
 
 #[derive(Clone)]
@@ -206,18 +234,39 @@ pub struct MappingContext<C: Blockchain> {
     pub proof_of_indexing: SharedProofOfIndexing,
     pub host_fns: Arc<Vec<HostFn>>,
     pub debug_fork: Option<Arc<dyn SubgraphFork>>,
+    pub other_block_ptrs: Vec<BlockPtr>,
+    pub other_states: Vec<BlockState<C>>,
+
 }
 
 impl<C: Blockchain> MappingContext<C> {
     pub fn derive_with_empty_block_state(&self) -> Self {
+
+
+
+        let mut new_other_states = Vec::new();
+
+        for i in 0..self.other_states.len(){
+            let state = BlockState::new(self.other_states[i].entity_cache.store.clone(), Default::default());
+            new_other_states.push(state);
+        }
+
+
+
         MappingContext {
             logger: self.logger.cheap_clone(),
             host_exports: self.host_exports.cheap_clone(),
-            block_ptr: self.block_ptr.cheap_clone(),
-            state: BlockState::new(self.state.entity_cache.store.clone(), Default::default()),
+            block_ptr: self.block_ptr.clone(),
+            // state: new_state,
+
+            state:BlockState::new(self.state.entity_cache.store.clone(), Default::default()),
             proof_of_indexing: self.proof_of_indexing.cheap_clone(),
             host_fns: self.host_fns.cheap_clone(),
             debug_fork: self.debug_fork.cheap_clone(),
+
+
+            other_block_ptrs:self.other_block_ptrs.clone(),
+            other_states:new_other_states,
         }
     }
 }

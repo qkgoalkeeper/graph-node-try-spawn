@@ -20,13 +20,13 @@ where
         &self,
         logger: &Logger,
         hosts: &[Arc<T::Host>],
-        block: &Arc<C::Block>,
-        trigger: &Vec<C::TriggerData>,
-        mut state: BlockState<C>,
+        block: &Vec<Arc<C::Block>>,
+        trigger: &Vec<Vec<C::TriggerData>>,
+        mut state: Vec<BlockState<C>>,
         proof_of_indexing: &SharedProofOfIndexing,
         causality_region: &str,
         debug_fork: &Option<Arc<dyn SubgraphFork>>,
         subgraph_metrics: &Arc<SubgraphInstanceMetrics>,
-    ) -> Result<BlockState<C>, MappingError>;
+    ) -> Result<Vec<BlockState<C>>, MappingError>;
 
 }

@@ -146,15 +146,15 @@ where
     async fn send_mapping_request(
         &self,
         logger: &Logger,
-        state: BlockState<C>,
-        triggers: Vec<TriggerWithHandler<C>>,
-        block_ptr: BlockPtr,
+        mut state: Vec<BlockState<C>>,
+        mut triggers: Vec<Vec<TriggerWithHandler<C>>>,
+        mut block_ptr: Vec<BlockPtr>,
         proof_of_indexing: SharedProofOfIndexing,
         debug_fork: &Option<Arc<dyn SubgraphFork>>,
-    ) -> Result<BlockState<C>, MappingError> {
-        let handler = triggers[0].handler_name().to_string();
+    ) -> Result<Vec<BlockState<C>>, MappingError> {
+        let handler = triggers[0][0].handler_name().to_string();
 
-        let extras = triggers[0].logging_extras();
+        let extras = triggers[0][0].logging_extras();
         trace!(
             logger, "Start processing trigger";
             &extras,
@@ -165,18 +165,44 @@ where
         let (result_sender, result_receiver) = channel();
         let start_time = Instant::now();
         let metrics = self.metrics.clone();
+        if(state.len()!=triggers.len()){
+            println!("error state.len()!=triggers.len()");
+        }
+
+        if(state.len()<=0){
+            println!("error state.len()<=0");
+        }
+        let state_head = state.pop().unwrap();
+        let block_ptr_head = block_ptr.pop().unwrap();
+
+        let mut other_states_temp = Vec::new();
+        let mut other_block_ptrs_temp = Vec::new();
+
+        for i in 0..state.len(){
+            let temp_state = state.pop().unwrap();
+            other_states_temp.push(temp_state);
+        }
+
+
+
+        for i in 0..block_ptr.len(){
+            let temp_block_ptr = block_ptr.pop().unwrap();
+            other_block_ptrs_temp.push(temp_block_ptr);
+        }
 
         self.mapping_request_sender
             .clone()
             .send(MappingRequest {
                 ctx: MappingContext {
                     logger: logger.cheap_clone(),
-                    state,
+                    state: state_head,
                     host_exports: self.host_exports.cheap_clone(),
-                    block_ptr,
+                    block_ptr: block_ptr_head,
                     proof_of_indexing,
                     host_fns: self.host_fns.cheap_clone(),
                     debug_fork: debug_fork.cheap_clone(),
+                    other_states:other_states_temp,
+                    other_block_ptrs:other_block_ptrs_temp,
                 },
                 triggers,
                 result_sender,
@@ -187,12 +213,12 @@ where
         
         
         
-        let mut result = result_receiver
+        let mut result_blocks = result_receiver
             .await
             .context("Mapping terminated before handling trigger")?;
             
-
-        println!("------------block_state results size:{}-------------------",result.len());
+        result_blocks.sort_by(|a,b|{(b.1.block_number()).cmp(&a.1.block_number())});
+        // println!("------------block_state results size:{}-------------------",result.len());
         
        /* for i in 0..result.len(){
             println!("{}",i);
@@ -200,41 +226,71 @@ where
             println!("{:?}",resut_copy.0.entity_cache);
         }*/
 
-        println!("------------END block_state results-------------------");
+        // println!("------------END block_state results-------------------");
         let elapsed = start_time.elapsed();
         metrics.observe_handler_execution_time(elapsed.as_secs_f64(), &handler);
-        let mut final_state_res=result.pop().unwrap();
-        let gas_used = final_state_res.as_ref().map(|(_, gas)| gas).unwrap_or(&Gas::ZERO);
-        info!(
-            logger, "Done processing trigger";
-            &extras,
-            "total_ms" => elapsed.as_millis(),
-            "handler" => handler.clone(),
-            "data_source" => &self.data_source.name(),
-            "gas_used" => gas_used.to_string(),
-        );
-        while !result.is_empty()
-        {
-            //let next_state_res=result.pop().unwrap();
-            let block_state_res=result.pop().unwrap();
-            let final_state=final_state_res.as_mut().unwrap();
-            let next_state=block_state_res.unwrap();
-            final_state.0.combine(next_state.0);
-            final_state.1+=next_state.1;
+
+
+
+
+        let mut final_state_res= Vec::new();
+        
+        // result.pop().unwrap();
+
+
+        // let gas_used = final_state_res.as_ref().map(|(_, gas)| gas).unwrap_or(&Gas::ZERO);
+        // info!(
+        //     logger, "Done processing trigger";
+        //     &extras,
+        //     "total_ms" => elapsed.as_millis(),
+        //     "handler" => handler.clone(),
+        //     "data_source" => &self.data_source.name(),
+        //     "gas_used" => gas_used.to_string(),
+        // );
+
+        for i in 0..result_blocks.len(){
+
+            let mut result_struct = result_blocks.pop().unwrap();
+
+            let mut result = result_struct.0;
+
+            let mut final_state_res_block = result.pop().unwrap();
+
+ 
+
+            while !result.is_empty()
+            {
+                let block_state_res=result.pop().unwrap();
+                let final_state=final_state_res_block.as_mut().unwrap();
+                let next_state=block_state_res.unwrap();
+                final_state.0.combine(next_state.0);
+                final_state.1+=next_state.1;
+            }
+            
+            let final_state_res_block = final_state_res_block.map(|(block_state, _)| block_state).unwrap();
+
+
+            final_state_res.push(final_state_res_block)
+
         }
-        println!("------------final_state results-------------------");
+
+        Ok(final_state_res)
+
+        // println!("------------final_state results-------------------");
         //let resut_copy=final_state_res.as_ref().unwrap().clone();
         //println!("{:?}",resut_copy.0.entity_cache);
-        let gas_used = final_state_res.as_ref().map(|(_, gas)| gas).unwrap_or(&Gas::ZERO);
-            info!(
-                logger, "Done processing trigger";
-                &extras,
-                "total_ms" => elapsed.as_millis(),
-                "handler" => handler.clone(),
-                "data_source" => &self.data_source.name(),
-                "gas_used" => gas_used.to_string(),
-            );
-        final_state_res.map(|(block_state, _)| block_state)
+        // let gas_used = final_state_res.as_ref().map(|(_, gas)| gas).unwrap_or(&Gas::ZERO);
+        //     info!(
+        //         logger, "Done processing trigger";
+        //         &extras,
+        //         "total_ms" => elapsed.as_millis(),
+        //         "handler" => handler.clone(),
+        //         "data_source" => &self.data_source.name(),
+        //         "gas_used" => gas_used.to_string(),
+        //     );
+
+
+        // final_state_res.map(|(block_state, _)| block_state)
         /*let block_state_res=result.pop().unwrap();
         // If there is an error, "gas_used" is incorrectly reported as 0.
         let gas_used = block_state_res.as_ref().map(|(_, gas)| gas).unwrap_or(&Gas::ZERO);
@@ -270,12 +326,12 @@ impl<C: Blockchain> RuntimeHostTrait<C> for RuntimeHost<C> {
     async fn process_mapping_trigger(
         &self,
         logger: &Logger,
-        block_ptr: BlockPtr,
-        trigger: Vec<TriggerWithHandler<C>>,
-        state: BlockState<C>,
+        block_ptr: Vec<BlockPtr>,
+        trigger: Vec<Vec<TriggerWithHandler<C>>>,
+        state: Vec<BlockState<C>>,
         proof_of_indexing: SharedProofOfIndexing,
         debug_fork: &Option<Arc<dyn SubgraphFork>>,
-    ) -> Result<BlockState<C>, MappingError> {
+    ) -> Result<Vec<BlockState<C>>, MappingError> {
         self.send_mapping_request(
             logger,
             state,

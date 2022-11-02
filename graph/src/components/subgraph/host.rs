@@ -54,12 +54,12 @@ pub trait RuntimeHost<C: Blockchain>: Send + Sync + 'static {
     async fn process_mapping_trigger(
         &self,
         logger: &Logger,
-        block_ptr: BlockPtr,
-        trigger: Vec<TriggerWithHandler<C>>,
-        state: BlockState<C>,
+        block_ptr: Vec<BlockPtr>,
+        trigger: Vec<Vec<TriggerWithHandler<C>>>,
+        state: Vec<BlockState<C>>,
         proof_of_indexing: SharedProofOfIndexing,
         debug_fork: &Option<Arc<dyn SubgraphFork>>,
-    ) -> Result<BlockState<C>, MappingError>;
+    ) -> Result<Vec<BlockState<C>>, MappingError>;
 
     /// Block number in which this host was created.
     /// Returns `None` for static data sources.

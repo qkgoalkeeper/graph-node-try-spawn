@@ -65,6 +65,7 @@ where
     }
 
     pub async fn run(mut self) -> Result<(), Error> {
+        // println!("fn run");
         // If a subgraph failed for deterministic reasons, before start indexing, we first
         // revert the deployment head. It should lead to the same result since the error was
         // deterministic.
@@ -112,16 +113,23 @@ where
 
             // Process events from the stream as long as no restart is needed
             loop {
-                let event = {
-                    let _section = self.metrics.stream.stopwatch.start_section("scan_blocks");
+                let mut events = Vec::new();
+                for i in 0..8{
+                    let event = {
+                        let _section = self.metrics.stream.stopwatch.start_section("scan_blocks");
+    
+                        block_stream.next().await
+                    };
+                    events.push(event);
 
-                    block_stream.next().await
-                };
+                }
+            
+
 
                 // TODO: move cancel handle to the Context
                 // This will require some code refactor in how the BlockStream is created
                 match self
-                    .handle_stream_event(event, &block_stream_cancel_handle)
+                    .handle_stream_event(events, &block_stream_cancel_handle)
                     .await?
                 {
                     Action::Continue => continue,
@@ -141,48 +149,68 @@ where
     async fn process_block(
         &mut self,
         block_stream_cancel_handle: &CancelHandle,
-        block: BlockWithTriggers<C>,
-        firehose_cursor: FirehoseCursor,
+        blocks: Vec<BlockWithTriggers<C>>,
+        mut firehose_cursor: Vec<FirehoseCursor>,
     ) -> Result<Action, BlockProcessingError> {
-        let triggers = block.trigger_data;
-        let block = Arc::new(block.block);
-        let block_ptr = block.ptr();
+        // println!("fn process_block");
+        let mut blocks_vec = Vec::new();
+        let mut triggers_vec = Vec::new();
+        let mut block_ptrs = Vec::new();
 
-        let logger = self.logger.new(o!(
-                "block_number" => format!("{:?}", block_ptr.number),
-                "block_hash" => format!("{}", block_ptr.hash)
+        let mut logger = self.logger.new(o!(
+            "block_number" => format!("{:?}", blocks[0].ptr().number),
+            "block_hash" => format!("{}", blocks[0].ptr().hash)
         ));
 
-        if triggers.len() == 1 {
-            debug!(&logger, "1 candidate trigger in this block");
-        } else {
-            debug!(
-                &logger,
-                "{} candidate triggers in this block",
-                triggers.len()
-            );
+        let proof_of_indexing = None;
+
+        for i in 0..blocks.len(){
+            let triggers = blocks[i].trigger_data.clone();
+            let block = Arc::new(blocks[i].block.clone());
+            let block_ptr = blocks[i].ptr();
+    
+            logger = self.logger.new(o!(
+                    "block_number" => format!("{:?}", block_ptr.number),
+                    "block_hash" => format!("{}", block_ptr.hash)
+            ));
+    
+            if triggers.len() == 1 {
+                debug!(&logger, "1 candidate trigger in this block");
+            } else {
+                debug!(
+                    &logger,
+                    "{} candidate triggers in this block",
+                    triggers.len()
+                );
+            }
+
+            triggers_vec.push(triggers);
+            blocks_vec.push(block);
+    
+            // let proof_of_indexing = if self.inputs.store.supports_proof_of_indexing().await? {
+            //     Some(Arc::new(AtomicRefCell::new(ProofOfIndexing::new(
+            //         block_ptr.number,
+            //         self.ctx.instance.poi_version.clone(),
+            //     ))))
+            // } else {
+            //     None
+            // };
+
+            block_ptrs.push(block_ptr);
         }
 
-        let proof_of_indexing = if self.inputs.store.supports_proof_of_indexing().await? {
-            Some(Arc::new(AtomicRefCell::new(ProofOfIndexing::new(
-                block_ptr.number,
-                self.ctx.instance.poi_version.clone(),
-            ))))
-        } else {
-            None
-        };
 
         // There are currently no other causality regions since offchain data is not supported.
         let causality_region = CausalityRegion::from_network(self.ctx.instance.network());
 
         // Process events one after the other, passing in entity operations
         // collected previously to every new event being processed
-        let mut block_state = match self
-            .process_triggers(&proof_of_indexing, &block, triggers, &causality_region)
+        let mut block_states = match self
+            .process_triggers(&proof_of_indexing, &blocks_vec, triggers_vec, &causality_region)
             .await
         {
             // Triggers processed with no errors or with only deterministic errors.
-            Ok(block_state) => block_state,
+            Ok(block_states) => block_states,
 
             // Some form of unknown or non-deterministic error ocurred.
             Err(MappingError::Unknown(e)) => return Err(BlockProcessingError::Unknown(e)),
@@ -205,7 +233,7 @@ where
 
         // If new data sources have been created, and static filters are not in use, it is necessary
         // to restart the block stream with the new filters.
-        let needs_restart = block_state.has_created_data_sources() && !self.inputs.static_filters;
+        let mut needs_restart = false;
 
         // This loop will:
         // 1. Instantiate created data sources.
@@ -215,73 +243,92 @@ where
         // Note that this algorithm processes data sources spawned on the same block _breadth
         // first_ on the tree implied by the parent-child relationship between data sources. Only a
         // very contrived subgraph would be able to observe this.
-        while block_state.has_created_data_sources() {
-            // Instantiate dynamic data sources, removing them from the block state.
-            let (data_sources, runtime_hosts) =
-                self.create_dynamic_data_sources(block_state.drain_created_data_sources())?;
+        let mut block_states_modified = Vec::new();
+        let mut has_errors = false;
 
-            let filter = C::TriggerFilter::from_data_sources(data_sources.iter());
+        for i in 0..block_states.len(){
 
-            // Reprocess the triggers from this block that match the new data sources
-            let block_with_triggers = self
-                .inputs
-                .triggers_adapter
-                .triggers_in_block(&logger, block.as_ref().clone(), &filter)
-                .await?;
-
-            let triggers = block_with_triggers.trigger_data;
-
-            if triggers.len() == 1 {
-                info!(
-                    &logger,
-                    "1 trigger found in this block for the new data sources"
-                );
-            } else if triggers.len() > 1 {
-                info!(
-                    &logger,
-                    "{} triggers found in this block for the new data sources",
-                    triggers.len()
-                );
+            let mut block_state = block_states.pop().unwrap();
+            if (block_state.has_created_data_sources() && !self.inputs.static_filters)==true{
+                needs_restart = true;
+            }
+            while block_state.has_created_data_sources() {
+                // Instantiate dynamic data sources, removing them from the block state.
+                let (data_sources, runtime_hosts) =
+                    self.create_dynamic_data_sources(block_state.drain_created_data_sources())?;
+    
+                let filter = C::TriggerFilter::from_data_sources(data_sources.iter());
+    
+                // Reprocess the triggers from this block that match the new data sources
+                let block_with_triggers = self
+                    .inputs
+                    .triggers_adapter
+                    .triggers_in_block(&logger, blocks_vec[i].as_ref().clone(), &filter)
+                    .await?;
+    
+                let triggers = block_with_triggers.trigger_data;
+    
+                if triggers.len() == 1 {
+                    info!(
+                        &logger,
+                        "1 trigger found in this block for the new data sources"
+                    );
+                } else if triggers.len() > 1 {
+                    info!(
+                        &logger,
+                        "{} triggers found in this block for the new data sources",
+                        triggers.len()
+                    );
+                }
+    
+                // Add entity operations for the new data sources to the block state
+                // and add runtimes for the data sources to the subgraph instance.
+                self.persist_dynamic_data_sources(&mut block_state.entity_cache, data_sources);
+    
+                // Process the triggers in each host in the same order the
+                // corresponding data sources have been created.
+                // for trigger in triggers {
+                // let temp_block = Vec::new();
+                // // temp_block.push()
+                // block_state = self
+                //     .ctx
+                //     .instance
+                //     .trigger_processor
+                //     .process_trigger(
+                //         &logger,
+                //         &runtime_hosts,
+                //         &blocks_vec[i],
+                //         &triggers,
+                //         block_state,
+                //         &proof_of_indexing,
+                //         &causality_region,
+                //         &self.inputs.debug_fork,
+                //         &self.metrics.subgraph,
+                //     )
+                //     .await
+                //     .map_err(|e| {
+                //         // This treats a `PossibleReorg` as an ordinary error which will fail the subgraph.
+                //         // This can cause an unnecessary subgraph failure, to fix it we need to figure out a
+                //         // way to revert the effect of `create_dynamic_data_sources` so we may return a
+                //         // clean context as in b21fa73b-6453-4340-99fb-1a78ec62efb1.
+                //         match e {
+                //             MappingError::PossibleReorg(e) | MappingError::Unknown(e) => {
+                //                 BlockProcessingError::Unknown(e)
+                //             }
+                //         }
+                //     })?;
+                // }
             }
 
-            // Add entity operations for the new data sources to the block state
-            // and add runtimes for the data sources to the subgraph instance.
-            self.persist_dynamic_data_sources(&mut block_state.entity_cache, data_sources);
+            if block_state.has_errors()==true{
+                has_errors = true;
+            }
 
-            // Process the triggers in each host in the same order the
-            // corresponding data sources have been created.
-            // for trigger in triggers {
-                block_state = self
-                    .ctx
-                    .instance
-                    .trigger_processor
-                    .process_trigger(
-                        &logger,
-                        &runtime_hosts,
-                        &block,
-                        &triggers,
-                        block_state,
-                        &proof_of_indexing,
-                        &causality_region,
-                        &self.inputs.debug_fork,
-                        &self.metrics.subgraph,
-                    )
-                    .await
-                    .map_err(|e| {
-                        // This treats a `PossibleReorg` as an ordinary error which will fail the subgraph.
-                        // This can cause an unnecessary subgraph failure, to fix it we need to figure out a
-                        // way to revert the effect of `create_dynamic_data_sources` so we may return a
-                        // clean context as in b21fa73b-6453-4340-99fb-1a78ec62efb1.
-                        match e {
-                            MappingError::PossibleReorg(e) | MappingError::Unknown(e) => {
-                                BlockProcessingError::Unknown(e)
-                            }
-                        }
-                    })?;
-            // }
+            block_states_modified.push(block_state);
+
         }
 
-        let has_errors = block_state.has_errors();
+        // let has_errors = block_state.has_errors();
         let is_non_fatal_errors_active = self
             .inputs
             .features
@@ -305,106 +352,126 @@ where
         //     .await?;
         // }
 
-        let section = self
-            .metrics
-            .host
-            .stopwatch
-            .start_section("as_modifications");
-        let ModificationsAndCache {
-            modifications: mut mods,
-            data_sources,
-            entity_lfu_cache: cache,
-        } = block_state
-            .entity_cache
-            .as_modifications()
-            .map_err(|e| BlockProcessingError::Unknown(e.into()))?;
-        section.end();
 
-        // Put the cache back in the state, asserting that the placeholder cache was not used.
-        assert!(self.state.entity_lfu_cache.is_empty());
-        self.state.entity_lfu_cache = cache;
+        for i in 0..block_states_modified.len(){
+            let block_state = block_states_modified.pop().unwrap();
+            let block_ptr = block_ptrs.pop().unwrap();
 
-        if !mods.is_empty() {
-            info!(&logger, "Applying {} entity operation(s)", mods.len());
-        }
-
-        let err_count = block_state.deterministic_errors.len();
-        for (i, e) in block_state.deterministic_errors.iter().enumerate() {
-            let message = format!("{:#}", e).replace("\n", "\t");
-            error!(&logger, "Subgraph error {}/{}", i + 1, err_count;
-                "error" => message,
-                "code" => LogCode::SubgraphSyncingFailure
+            let end_dt = Local::now();
+            println!(
+                "block {}  end  time: {} ",
+                &block_ptr.number,
+                end_dt.format("%Y-%m-%d %H:%M:%S:%.3f").to_string()
             );
-        }
 
-        // Transact entity operations into the store and update the
-        // subgraph's block stream pointer
-        let _section = self.metrics.host.stopwatch.start_section("transact_block");
-        let start = Instant::now();
-
-        let store = &self.inputs.store;
-
-        // If a deterministic error has happened, make the PoI to be the only entity that'll be stored.
-        if has_errors && !is_non_fatal_errors_active {
-            let is_poi_entity =
-                |entity_mod: &EntityModification| entity_mod.entity_key().entity_type.is_poi();
-            mods.retain(is_poi_entity);
-            // Confidence check
-            assert!(
-                mods.len() == 1,
-                "There should be only one PoI EntityModification"
-            );
-        }
-
-        let BlockState {
-            deterministic_errors,
-            ..
-        } = block_state;
-
-        let first_error = deterministic_errors.first().cloned();
-
-        store
-            .transact_block_operations(
-                block_ptr,
-                firehose_cursor,
-                mods,
-                &self.metrics.host.stopwatch,
+            let firehose_cursor_item = firehose_cursor[i].clone();
+            let section = self
+                .metrics
+                .host
+                .stopwatch
+                .start_section("as_modifications");
+            let ModificationsAndCache {
+                modifications: mut mods,
                 data_sources,
-                deterministic_errors,
-                self.inputs.manifest_idx_and_name.clone(),
-            )
-            .await
-            .context("Failed to transact block operations")?;
-
-        // For subgraphs with `nonFatalErrors` feature disabled, we consider
-        // any error as fatal.
-        //
-        // So we do an early return to make the subgraph stop processing blocks.
-        //
-        // In this scenario the only entity that is stored/transacted is the PoI,
-        // all of the others are discarded.
-        if has_errors && !is_non_fatal_errors_active {
-            // Only the first error is reported.
-            return Err(BlockProcessingError::Deterministic(first_error.unwrap()));
-        }
-
-        let elapsed = start.elapsed().as_secs_f64();
-        self.metrics
-            .subgraph
-            .block_ops_transaction_duration
-            .observe(elapsed);
-
-        // To prevent a buggy pending version from replacing a current version, if errors are
-        // present the subgraph will be unassigned.
-        if has_errors && !ENV_VARS.disable_fail_fast && !store.is_deployment_synced().await? {
-            store
-                .unassign_subgraph()
+                entity_lfu_cache: cache,
+            } = block_state
+                .entity_cache
+                .as_modifications()
                 .map_err(|e| BlockProcessingError::Unknown(e.into()))?;
+            section.end();
 
-            // Use `Canceled` to avoiding setting the subgraph health to failed, an error was
-            // just transacted so it will be already be set to unhealthy.
-            return Err(BlockProcessingError::Canceled);
+            // Put the cache back in the state, asserting that the placeholder cache was not used.
+            // assert!(self.state.entity_lfu_cache.is_empty());
+            self.state.entity_lfu_cache = cache;
+
+            if !mods.is_empty() {
+                info!(&logger, "Applying {} entity operation(s)", mods.len());
+            }
+
+            let err_count = block_state.deterministic_errors.len();
+            for (i, e) in block_state.deterministic_errors.iter().enumerate() {
+                let message = format!("{:#}", e).replace("\n", "\t");
+                error!(&logger, "Subgraph error {}/{}", i + 1, err_count;
+                    "error" => message,
+                    "code" => LogCode::SubgraphSyncingFailure
+                );
+            }
+
+            // Transact entity operations into the store and update the
+            // subgraph's block stream pointer
+            let _section = self.metrics.host.stopwatch.start_section("transact_block");
+            let start = Instant::now();
+
+            let store = &self.inputs.store;
+
+            // If a deterministic error has happened, make the PoI to be the only entity that'll be stored.
+            if has_errors && !is_non_fatal_errors_active {
+                let is_poi_entity =
+                    |entity_mod: &EntityModification| entity_mod.entity_key().entity_type.is_poi();
+                mods.retain(is_poi_entity);
+                // Confidence check
+                assert!(
+                    mods.len() == 1,
+                    "There should be only one PoI EntityModification"
+                );
+            }
+
+            let BlockState {
+                deterministic_errors,
+                ..
+            } = block_state;
+
+            let first_error = deterministic_errors.first().cloned();
+
+            store
+                .transact_block_operations(
+                    block_ptr,
+                    firehose_cursor_item,
+                    mods,
+                    &self.metrics.host.stopwatch,
+                    data_sources,
+                    deterministic_errors,
+                    self.inputs.manifest_idx_and_name.clone(),
+                )
+                .await
+                .context("Failed to transact block operations")?;
+
+            // For subgraphs with `nonFatalErrors` feature disabled, we consider
+            // any error as fatal.
+            //
+            // So we do an early return to make the subgraph stop processing blocks.
+            //
+            // In this scenario the only entity that is stored/transacted is the PoI,
+            // all of the others are discarded.
+            if has_errors && !is_non_fatal_errors_active {
+                // Only the first error is reported.
+                return Err(BlockProcessingError::Deterministic(first_error.unwrap()));
+            }
+
+            let elapsed = start.elapsed().as_secs_f64();
+            self.metrics
+                .subgraph
+                .block_ops_transaction_duration
+                .observe(elapsed);
+
+            // To prevent a buggy pending version from replacing a current version, if errors are
+            // present the subgraph will be unassigned.
+            if has_errors && !ENV_VARS.disable_fail_fast && !store.is_deployment_synced().await? {
+                store
+                    .unassign_subgraph()
+                    .map_err(|e| BlockProcessingError::Unknown(e.into()))?;
+
+                // Use `Canceled` to avoiding setting the subgraph health to failed, an error was
+                // just transacted so it will be already be set to unhealthy.
+                return Err(BlockProcessingError::Canceled);
+            }
         }
+
+
+
+
+
+
 
         match needs_restart {
             true => Ok(Action::Restart),
@@ -415,39 +482,51 @@ where
     async fn process_triggers(
         &mut self,
         proof_of_indexing: &SharedProofOfIndexing,
-        block: &Arc<C::Block>,
-        triggers: Vec<C::TriggerData>,
+        block: &Vec<Arc<C::Block>>,
+        triggers: Vec<Vec<C::TriggerData>>,
         causality_region: &str,
-    ) -> Result<BlockState<C>, MappingError> {
+    ) -> Result<Vec<BlockState<C>>, MappingError> {
         use graph::blockchain::TriggerData;
 
         // let (tx,rx)=channel();
-        
-        let mut block_state = BlockState::new(
-            self.inputs.store.clone(),
-            std::mem::take(&mut self.state.entity_lfu_cache),
-        );
+        let mut block_states = Vec::new();
+        // println!("fn process_triggers");
+        for i in 0..block.len(){
 
-        block_state = self.ctx.instance.
+
+            let mut block_state = BlockState::new(
+                self.inputs.store.clone(),
+                std::mem::take(&mut self.state.entity_lfu_cache),
+            );
+
+            block_states.push(block_state);
+        }
+
+
+        let block_states = self.ctx.instance.
                     process_trigger(
                         &self.logger,
-                        block, 
+                        &block, 
                         &triggers, 
-                        block_state, 
+                        block_states, 
                         proof_of_indexing, 
                         causality_region, 
                         &self.inputs.debug_fork,
                         &self.metrics.subgraph)
                         .await
                         .map_err(move |mut e| {
-                            let error_context = triggers[0].error_context();
+                            let error_context = triggers[0][0].error_context();
                             if !error_context.is_empty() {
                                 e = e.context(error_context);
                             }
                             e.context("failed to process trigger".to_string())
                         })?;
         
-        Ok(block_state)
+
+        
+
+        
+        Ok(block_states)
     }
 
     fn create_dynamic_data_sources(
@@ -528,24 +607,38 @@ where
 {
     async fn handle_stream_event(
         &mut self,
-        event: Option<Result<BlockStreamEvent<C>, CancelableError<Error>>>,
+        events: Vec<Option<Result<BlockStreamEvent<C>, CancelableError<Error>>>>,
         cancel_handle: &CancelHandle,
     ) -> Result<Action, Error> {
-        let action = match event {
-            Some(Ok(BlockStreamEvent::ProcessBlock(block, cursor))) => {
-                self.handle_process_block(block, cursor, cancel_handle)
-                    .await?
-            }
-            Some(Ok(BlockStreamEvent::Revert(revert_to_ptr, cursor))) => {
-                self.handle_revert(revert_to_ptr, cursor).await?
-            }
-            // Log and drop the errors from the block_stream
-            // The block stream will continue attempting to produce blocks
-            Some(Err(e)) => self.handle_err(e, cancel_handle).await?,
-            // If the block stream ends, that means that there is no more indexing to do.
-            // Typically block streams produce indefinitely, but tests are an example of finite block streams.
-            None => Action::Stop,
-        };
+        // println!("fn handle_stream_event");
+        let mut blocks = Vec::new();
+        let mut cursors = Vec::new();
+        let mut action = Action::Continue;
+        for event in events{
+            action = match event {
+                Some(Ok(BlockStreamEvent::ProcessBlock(block, cursor))) => {
+                    blocks.push(block);
+                    cursors.push(cursor);
+                    // self.handle_process_block(block, cursor, cancel_handle)
+                    //     .await?
+                    Action::Continue
+                }
+                Some(Ok(BlockStreamEvent::Revert(revert_to_ptr, cursor))) => {
+                    self.handle_revert(revert_to_ptr, cursor).await?
+                }
+                // Log and drop the errors from the block_stream
+                // The block stream will continue attempting to produce blocks
+                Some(Err(e)) => self.handle_err(e, cancel_handle).await?,
+                // If the block stream ends, that means that there is no more indexing to do.
+                // Typically block streams produce indefinitely, but tests are an example of finite block streams.
+                None => Action::Stop,
+            };
+        }
+
+
+
+        action = self.handle_process_block(blocks, cursors, cancel_handle).await?;
+
 
         Ok(action)
     }
@@ -561,8 +654,8 @@ enum Action {
 trait StreamEventHandler<C: Blockchain> {
     async fn handle_process_block(
         &mut self,
-        block: BlockWithTriggers<C>,
-        cursor: FirehoseCursor,
+        mut blocks: Vec<BlockWithTriggers<C>>,
+        mut cursors: Vec<FirehoseCursor>,
         cancel_handle: &CancelHandle,
     ) -> Result<Action, Error>;
     async fn handle_revert(
@@ -585,51 +678,83 @@ where
 {
     async fn handle_process_block(
         &mut self,
-        block: BlockWithTriggers<C>,
-        cursor: FirehoseCursor,
+        mut blocks: Vec<BlockWithTriggers<C>>,
+        cursor: Vec<FirehoseCursor>,
         cancel_handle: &CancelHandle,
     ) -> Result<Action, Error> {
-        let block_ptr = block.ptr();
-        self.metrics
-            .stream
-            .deployment_head
-            .set(block_ptr.number as f64);
+        // println!("fn handle_process_block");
+        let mut blocks_havingtrigger = Vec::new();
 
-        if block.trigger_count() > 0 {
+        let mut trigger_count_for_blocks = 0;
+        let mut block_ptr = blocks[0].ptr();
+
+        for i in 0..blocks.len(){
+            let block = blocks.pop().unwrap();
+
+
+            block_ptr = block.ptr();
+            self.metrics
+                .stream
+                .deployment_head
+                .set(block_ptr.number as f64);
+            if block.trigger_count()>0{
+                trigger_count_for_blocks += block.trigger_count();
+                blocks_havingtrigger.push(block);
+            }
+        }
+        
+        // if block.trigger_count() > 0 {
+        //     self.metrics
+        //         .subgraph
+        //         .block_trigger_count
+        //         .observe(block.trigger_count() as f64);
+        // }
+
+        // if block.trigger_count() == 0
+        //     && self.state.skip_ptr_updates_timer.elapsed() <= SKIP_PTR_UPDATES_THRESHOLD
+        //     && !self.state.synced
+        //     && !close_to_chain_head(
+        //         &block_ptr,
+        //         self.inputs.chain.chain_store().cached_head_ptr().await?,
+        //         // The "skip ptr updates timer" is ignored when a subgraph is at most 1000 blocks
+        //         // behind the chain head.
+        //         1000,
+        //     )
+        // {
+        //     return Ok(Action::Continue);
+        // } else {
+        //     self.state.skip_ptr_updates_timer = Instant::now();
+        // }
+
+
+        if trigger_count_for_blocks > 0 {
             self.metrics
                 .subgraph
                 .block_trigger_count
-                .observe(block.trigger_count() as f64);
+                .observe(trigger_count_for_blocks as f64);
+        }
+        if trigger_count_for_blocks == 0{
+            return Ok(Action::Continue);
         }
 
-        if block.trigger_count() == 0
-            && self.state.skip_ptr_updates_timer.elapsed() <= SKIP_PTR_UPDATES_THRESHOLD
-            && !self.state.synced
-            && !close_to_chain_head(
-                &block_ptr,
-                self.inputs.chain.chain_store().cached_head_ptr().await?,
-                // The "skip ptr updates timer" is ignored when a subgraph is at most 1000 blocks
-                // behind the chain head.
-                1000,
-            )
-        {
-            return Ok(Action::Continue);
-        } else {
-            self.state.skip_ptr_updates_timer = Instant::now();
-        }
+
 
         let start = Instant::now();
 
-        let res = self.process_block(&cancel_handle, block, cursor).await;
+        // let res = self.process_block(&cancel_handle, block, cursor).await;
+
+
+        let res = self.process_block(&cancel_handle, blocks_havingtrigger, cursor).await;
+
 
 
         let end_dt = Local::now();
-        println!(
-            "block {}  end  time: {} ",
-            &block_ptr.number,
-            end_dt.format("%Y-%m-%d %H:%M:%S:%.3f").to_string()
-        );
-        let elapsed = start.elapsed().as_secs_f64();
+        // println!(
+        //     "block {}  end  time: {} ",
+        //     &block_ptr.number,
+        //     end_dt.format("%Y-%m-%d %H:%M:%S:%.3f").to_string()
+        // );
+
 
 
 
