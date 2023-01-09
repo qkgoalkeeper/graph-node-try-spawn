@@ -27,7 +27,7 @@ graph-runtime-derive = { path = "../../runtime/derive" }
 [dev-dependencies]
 graph-core = { path = "../../core" }
 test-store = { path = "../../store/test-store" }
-base64 = "0.13.0"
+base64 = "0.21.0"
 
 [build-dependencies]
 tonic-build = { version = "0.7.2", features = ["prost"] }
